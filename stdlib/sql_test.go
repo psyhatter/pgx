@@ -4,14 +4,15 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
-	"database/sql/driver"
 	"encoding/json"
 	"math"
 	"os"
 	"reflect"
+	"regexp"
 	"testing"
 	"time"
 
+	"github.com/Masterminds/semver/v3"
 	"github.com/jackc/pgconn"
 	"github.com/jackc/pgx/v4"
 	"github.com/jackc/pgx/v4/stdlib"
@@ -38,6 +39,38 @@ func skipCockroachDB(t testing.TB, db *sql.DB, msg string) {
 	err = conn.Raw(func(driverConn interface{}) error {
 		conn := driverConn.(*stdlib.Conn).Conn()
 		if conn.PgConn().ParameterStatus("crdb_version") != "" {
+			t.Skip(msg)
+		}
+		return nil
+	})
+	require.NoError(t, err)
+}
+
+func skipPostgreSQLVersion(t testing.TB, db *sql.DB, constraintStr, msg string) {
+	conn, err := db.Conn(context.Background())
+	require.NoError(t, err)
+	defer conn.Close()
+
+	err = conn.Raw(func(driverConn interface{}) error {
+		conn := driverConn.(*stdlib.Conn).Conn()
+		serverVersionStr := conn.PgConn().ParameterStatus("server_version")
+		serverVersionStr = regexp.MustCompile(`^[0-9.]+`).FindString(serverVersionStr)
+		// if not PostgreSQL do nothing
+		if serverVersionStr == "" {
+			return nil
+		}
+
+		serverVersion, err := semver.NewVersion(serverVersionStr)
+		if err != nil {
+			return err
+		}
+
+		c, err := semver.NewConstraint(constraintStr)
+		if err != nil {
+			return err
+		}
+
+		if c.Check(serverVersion) {
 			t.Skip(msg)
 		}
 		return nil
@@ -685,7 +718,8 @@ func TestConnExecContextSuccess(t *testing.T) {
 
 func TestConnExecContextFailureRetry(t *testing.T) {
 	testWithAndWithoutPreferSimpleProtocol(t, func(t *testing.T, db *sql.DB) {
-		// we get a connection, immediately close it, and then get it back
+		// We get a connection, immediately close it, and then get it back;
+		// DB.Conn along with Conn.ResetSession does the retry for us.
 		{
 			conn, err := stdlib.AcquireConn(db)
 			require.NoError(t, err)
@@ -695,7 +729,7 @@ func TestConnExecContextFailureRetry(t *testing.T) {
 		conn, err := db.Conn(context.Background())
 		require.NoError(t, err)
 		_, err = conn.ExecContext(context.Background(), "select 1")
-		require.EqualValues(t, driver.ErrBadConn, err)
+		require.NoError(t, err)
 	})
 }
 
@@ -715,7 +749,8 @@ func TestConnQueryContextSuccess(t *testing.T) {
 
 func TestConnQueryContextFailureRetry(t *testing.T) {
 	testWithAndWithoutPreferSimpleProtocol(t, func(t *testing.T, db *sql.DB) {
-		// we get a connection, immediately close it, and then get it back
+		// We get a connection, immediately close it, and then get it back;
+		// DB.Conn along with Conn.ResetSession does the retry for us.
 		{
 			conn, err := stdlib.AcquireConn(db)
 			require.NoError(t, err)
@@ -726,7 +761,7 @@ func TestConnQueryContextFailureRetry(t *testing.T) {
 		require.NoError(t, err)
 
 		_, err = conn.QueryContext(context.Background(), "select 1")
-		require.EqualValues(t, driver.ErrBadConn, err)
+		require.NoError(t, err)
 	})
 }
 
@@ -1032,8 +1067,15 @@ func TestRegisterConnConfig(t *testing.T) {
 	logger := &testLogger{}
 	connConfig.Logger = logger
 
+	// Issue 947: Register and unregister a ConnConfig and ensure that the
+	// returned connection string is not reused.
 	connStr := stdlib.RegisterConnConfig(connConfig)
+	require.Equal(t, "registeredConnConfig0", connStr)
+	stdlib.UnregisterConnConfig(connStr)
+
+	connStr = stdlib.RegisterConnConfig(connConfig)
 	defer stdlib.UnregisterConnConfig(connStr)
+	require.Equal(t, "registeredConnConfig1", connStr)
 
 	db, err := sql.Open("pgx", connStr)
 	require.NoError(t, err)
@@ -1046,4 +1088,140 @@ func TestRegisterConnConfig(t *testing.T) {
 	l := logger.logs[len(logger.logs)-1]
 	assert.Equal(t, "Query", l.msg)
 	assert.Equal(t, "select 1", l.data["sql"])
+}
+
+// https://github.com/jackc/pgx/issues/958
+func TestConnQueryRowConstraintErrors(t *testing.T) {
+	testWithAndWithoutPreferSimpleProtocol(t, func(t *testing.T, db *sql.DB) {
+		skipPostgreSQLVersion(t, db, "< 11", "Test requires PG 11+")
+		skipCockroachDB(t, db, "Server does not support deferred constraint (https://github.com/cockroachdb/cockroach/issues/31632)")
+
+		_, err := db.Exec(`create temporary table defer_test (
+			id text primary key,
+			n int not null, unique (n),
+			unique (n) deferrable initially deferred )`)
+		require.NoError(t, err)
+
+		_, err = db.Exec(`drop function if exists test_trigger cascade`)
+		require.NoError(t, err)
+
+		_, err = db.Exec(`create function test_trigger() returns trigger language plpgsql as $$
+		begin
+		if new.n = 4 then
+			raise exception 'n cant be 4!';
+		end if;
+		return new;
+	end$$`)
+		require.NoError(t, err)
+
+		_, err = db.Exec(`create constraint trigger test
+			after insert or update on defer_test
+			deferrable initially deferred
+			for each row
+			execute function test_trigger()`)
+		require.NoError(t, err)
+
+		_, err = db.Exec(`insert into defer_test (id, n) values ('a', 1), ('b', 2), ('c', 3)`)
+		require.NoError(t, err)
+
+		var id string
+		err = db.QueryRow(`insert into defer_test (id, n) values ('e', 4) returning id`).Scan(&id)
+		assert.Error(t, err)
+	})
+}
+
+func TestOptionBeforeAfterConnect(t *testing.T) {
+	config, err := pgx.ParseConfig(os.Getenv("PGX_TEST_DATABASE"))
+	require.NoError(t, err)
+
+	var beforeConnConfigs []*pgx.ConnConfig
+	var afterConns []*pgx.Conn
+	db := stdlib.OpenDB(*config,
+		stdlib.OptionBeforeConnect(func(ctx context.Context, connConfig *pgx.ConnConfig) error {
+			beforeConnConfigs = append(beforeConnConfigs, connConfig)
+			return nil
+		}),
+		stdlib.OptionAfterConnect(func(ctx context.Context, conn *pgx.Conn) error {
+			afterConns = append(afterConns, conn)
+			return nil
+		}))
+	defer closeDB(t, db)
+
+	// Force it to close and reopen a new connection after each query
+	db.SetMaxIdleConns(0)
+
+	_, err = db.Exec("select 1")
+	require.NoError(t, err)
+
+	_, err = db.Exec("select 1")
+	require.NoError(t, err)
+
+	require.Len(t, beforeConnConfigs, 2)
+	require.Len(t, afterConns, 2)
+
+	// Note: BeforeConnect creates a shallow copy, so the config contents will be the same but we wean to ensure they
+	// are different objects, so can't use require.NotEqual
+	require.False(t, config == beforeConnConfigs[0])
+	require.False(t, beforeConnConfigs[0] == beforeConnConfigs[1])
+}
+
+func TestRandomizeHostOrderFunc(t *testing.T) {
+	config, err := pgx.ParseConfig("postgres://host1,host2,host3")
+	require.NoError(t, err)
+
+	// Test that at some point we connect to all 3 hosts
+	hostsNotSeenYet := map[string]struct{}{
+		"host1": struct{}{},
+		"host2": struct{}{},
+		"host3": struct{}{},
+	}
+
+	// If we don't succeed within this many iterations, something is certainly wrong
+	for i := 0; i < 100000; i++ {
+		connCopy := *config
+		stdlib.RandomizeHostOrderFunc(context.Background(), &connCopy)
+
+		delete(hostsNotSeenYet, connCopy.Host)
+		if len(hostsNotSeenYet) == 0 {
+			return
+		}
+
+	hostCheckLoop:
+		for _, h := range []string{"host1", "host2", "host3"} {
+			if connCopy.Host == h {
+				continue
+			}
+			for _, f := range connCopy.Fallbacks {
+				if f.Host == h {
+					continue hostCheckLoop
+				}
+			}
+			require.Failf(t, "got configuration from RandomizeHostOrderFunc that did not have all the hosts", "%+v", connCopy)
+		}
+	}
+
+	require.Fail(t, "did not get all hosts as primaries after many randomizations")
+}
+
+func TestResetSessionHookCalled(t *testing.T) {
+	var mockCalled bool
+
+	connConfig, err := pgx.ParseConfig(os.Getenv("PGX_TEST_DATABASE"))
+	require.NoError(t, err)
+
+	db := stdlib.OpenDB(*connConfig, stdlib.OptionResetSession(func(ctx context.Context, conn *pgx.Conn) error {
+		mockCalled = true
+
+		return nil
+	}))
+
+	defer closeDB(t, db)
+
+	err = db.Ping()
+	require.NoError(t, err)
+
+	err = db.Ping()
+	require.NoError(t, err)
+
+	require.True(t, mockCalled)
 }

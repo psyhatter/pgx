@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"reflect"
@@ -17,12 +18,10 @@ import (
 	"github.com/jackc/pgconn"
 	"github.com/jackc/pgconn/stmtcache"
 	"github.com/jackc/pgtype"
-	gofrs "github.com/jackc/pgtype/ext/gofrs-uuid"
 	"github.com/jackc/pgx/v4"
 	"github.com/shopspring/decimal"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	errors "golang.org/x/xerrors"
 )
 
 func TestConnQueryScan(t *testing.T) {
@@ -684,7 +683,7 @@ func TestQueryRowCoreTypes(t *testing.T) {
 			t.Errorf("%d. Unexpected failure: %v (sql -> %v, queryArgs -> %v)", i, err, tt.sql, tt.queryArgs)
 		}
 
-		if actual != tt.expected {
+		if actual.s != tt.expected.s || actual.f32 != tt.expected.f32 || actual.b != tt.expected.b || !actual.t.Equal(tt.expected.t) || actual.oid != tt.expected.oid {
 			t.Errorf("%d. Expected %v, got %v (sql -> %v, queryArgs -> %v)", i, tt.expected, actual, tt.sql, tt.queryArgs)
 		}
 
@@ -1235,12 +1234,6 @@ func TestConnQueryDatabaseSQLDriverValuerWithBinaryPgTypeThatAcceptsSameType(t *
 
 	conn := mustConnectString(t, os.Getenv("PGX_TEST_DATABASE"))
 	defer closeConn(t, conn)
-
-	conn.ConnInfo().RegisterDataType(pgtype.DataType{
-		Value: &gofrs.UUID{},
-		Name:  "uuid",
-		OID:   2950,
-	})
 
 	expected, err := uuid.FromString("6ba7b810-9dad-11d1-80b4-00c04fd430c8")
 	if err != nil {
